@@ -10,6 +10,10 @@
  * - **先落盘后改内存**：任何内存 head 切换、界面历史更新与 BroadcastChannel
  *   广播都只在完整状态原子写入成功之后发生；写入失败时内存与广播保持
  *   提交前状态，由调用方向用户显示明确错误（绝不产生刷新即丢的幽灵版本）；
+ * - **外部修订的接收也是单次事务**：关系判定在“当前图 + 新修订”的候选图
+ *   上纯计算，随后接收节点、head/冲突/挂起队列更新合并为一次原子落盘；
+ *   任何写入失败都整体回滚到接收前状态（不触发快进/冲突回调、不留半
+ *   提交节点），存储恢复后同一消息可重试，不会被当作重复消息吞掉；
  * - 同步判定只看修订图的祖先关系，禁止按时间戳覆盖：
  *   - 当前 head 是收到修订的祖先 → 快进；
  *   - 收到修订是当前 head 的祖先 → 忽略；
@@ -382,9 +386,12 @@ export class RevisionSync {
   // ---- 内部 ----
 
   /**
-   * 接收一个外部修订：先把完整状态原子落盘，成功后才更新内存并按修订图判定。
-   * 写入失败（配额耗尽/权限受限）时保留全部既有状态，仅提示，不触发
-   * 快进/冲突回调，也不会产生任何未持久化的幽灵修订。
+   * 接收一个外部修订：先在“当前图 + 新修订”的候选图上纯计算关系判定，
+   * 再把接收节点、head 切换、冲突标记与挂起队列更新合并为**一次**可回滚
+   * 事务——整个接收只发生一次原子落盘。任何写入失败（配额耗尽/权限受限）
+   * 都整体恢复到接收前的内存与持久化状态：不触发快进/冲突回调、图中不留
+   * 半提交节点，存储恢复后同一消息可完整重试（不会被当作重复消息吞掉）。
+   * BroadcastChannel 与 storage 事件两条入口都汇入本方法，行为一致。
    */
   private ingest(rev: Revision): void {
     if (this.destroyed) return;
@@ -392,15 +399,16 @@ export class RevisionSync {
       // 重复投递（storage 事件与频道消息可能各来一次）：无需再判定。
       return;
     }
+    // 候选图 = 当前图 + 新修订：所有祖先关系判定都在其上纯计算，不触碰内存。
+    const candidate = new Map(this.revisions);
+    candidate.set(rev.id, rev);
+
     if (this.conflictId !== null) {
       const conflictId = this.conflictId;
-      // 在候选图（含新修订）上预判：对方是否已提交同时覆盖本页 head 与冲突
-      // 版本的合并修订。判定本身是纯计算，不触碰内存。
-      const candidateRevisions = new Map(this.revisions);
-      candidateRevisions.set(rev.id, rev);
-      const relHead = relationOf(this.headId, rev.id, candidateRevisions);
+      // 对方是否已提交同时覆盖本页 head 与冲突版本的合并修订。
+      const relHead = relationOf(this.headId, rev.id, candidate);
       const resolvesConflict =
-        relHead === 'fast-forward' && isAncestor(conflictId, rev.id, candidateRevisions);
+        relHead === 'fast-forward' && isAncestor(conflictId, rev.id, candidate);
 
       if (resolvesConflict) {
         const pending = [...this.pendingIds];
@@ -437,17 +445,38 @@ export class RevisionSync {
       return;
     }
 
-    const result = this.transact(() => {
-      this.revisions.set(rev.id, rev);
-      this.order.push(rev.id);
-    });
+    // 非冲突接收：关系判定结果直接决定本次事务迁移的状态——节点入库、
+    // head 切换、冲突标记与挂起队列更新在同一次原子落盘中完成，杜绝
+    // “节点已保存、head/冲突状态未保存”的撕裂中间态。
+    const relation = relationOf(this.headId, rev.id, candidate);
+    const result = this.transact(
+      () => {
+        this.revisions.set(rev.id, rev);
+        this.order.push(rev.id);
+        if (relation === 'fast-forward') {
+          this.headId = rev.id;
+        } else if (relation === 'diverged') {
+          // 分叉（含祖先链缺失无法证明先后的情况）：保留两份，等待人工合并。
+          this.conflictId = rev.id;
+          if (!this.pendingIds.includes(rev.id)) this.pendingIds.push(rev.id);
+        }
+      },
+      relation === 'fast-forward'
+        ? () => this.handlers.onFastForward(rev)
+        : relation === 'diverged'
+          ? () => this.handlers.onConflict(rev)
+          : undefined,
+    );
     if (!result.ok) {
       this.handlers.onWarning(result.message);
-      return;
     }
-    this.classify(rev);
   }
 
+  /**
+   * 重新判定一个**已入库**的修订（冲突期间挂起、合并完成后由 resume() 或
+   * 自动消解路径触发）：节点已持久化在图中，这里只把 head/冲突/挂起队列
+   * 的迁移作为一次事务落盘；失败时快照回滚并提示，节点仍保留在图中。
+   */
   private classify(rev: Revision): void {
     const relation = relationOf(this.headId, rev.id, this.revisions);
     if (relation === 'same' || relation === 'stale') return;

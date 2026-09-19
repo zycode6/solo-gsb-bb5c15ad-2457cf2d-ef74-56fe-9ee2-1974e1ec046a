@@ -736,6 +736,122 @@ describe('存储写入失败（配额耗尽/权限限制）：先落盘后改内
     s.destroy();
   });
 
+  it('回归：接收合并为单次落盘——第二次写入失败的时序不再留下半提交节点（BroadcastChannel 入口）', async () => {
+    // 修复前故障时序：ingest 先写修订节点（第 1 次 setItem 成功），再单独写
+    // head/冲突状态（第 2 次 setItem 配额失败）→ 节点已保存、head 未切换，
+    // 重试同一消息被当作重复投递忽略，head 永远无法快进。
+    // 修复后：接收 + 关系判定 + head/冲突/挂起队列更新合并为一次可回滚事务，
+    // 整个接收只发生 1 次原子写入。
+    const storage = new MemStorage();
+    const r = rec();
+    const ch = new FakeChannel('test');
+    const s = openSync(storage, 'c1', r, counterUuid('m'), ch);
+    const genesis = s.head.id;
+
+    // 允许第 1 次状态写入、第 2 次配额失败（精确复现修复前的故障时序）
+    let writes = 0;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('QuotaExceededError');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    // 经 BroadcastChannel 入口送达线性后继 A：单次落盘即完整快进
+    const sender = new FakeChannel('test');
+    sender.postMessage({
+      type: 'revision',
+      revision: { id: 'a', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('A') },
+    });
+    await flush();
+    expect(writes).toBe(1); // 修复前这里会发生第 2 次写入并配额失败
+    expect(s.head.id).toBe('a');
+    expect(r.ff.map((f) => f.id)).toEqual(['a']);
+    expect(readState(storage).headId).toBe('a');
+
+    // 再送达后继 B：其接收事务（第 2 次写入）配额失败 → 整体回滚到接收前
+    const stateBefore = storage.getItem(STATE_STORAGE_KEY);
+    const warningsBefore = r.warnings.length;
+    sender.postMessage({
+      type: 'revision',
+      revision: { id: 'b', parentRevisionIds: ['a'], clientId: 'c2', plan: rootOnlyPlan('B') },
+    });
+    await flush();
+    expect(s.head.id).toBe('a'); // head 未切换
+    expect(s.getRevision('b')).toBeUndefined(); // 内存不留半提交节点
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateBefore); // 存储字节级不变
+    expect(r.ff.map((f) => f.id)).toEqual(['a']); // 不触发快进回调
+    expect(r.conflicts).toHaveLength(0);
+    expect(r.warnings.length).toBeGreaterThan(warningsBefore);
+    expect(r.warnings[r.warnings.length - 1]).toContain('本地存储');
+
+    // 存储恢复后重发同一条消息：不被当作重复投递，可完整重试成功
+    vi.restoreAllMocks();
+    sender.postMessage({
+      type: 'revision',
+      revision: { id: 'b', parentRevisionIds: ['a'], clientId: 'c2', plan: rootOnlyPlan('B') },
+    });
+    await flush();
+    expect(s.head.id).toBe('b');
+    expect(r.ff.map((f) => f.id)).toEqual(['a', 'b']);
+    expect(readState(storage).headId).toBe('b');
+    s.destroy();
+    sender.close();
+  });
+
+  it('回归：分叉接收同样单次落盘——冲突标记与节点同事务，第二次写入失败整体回滚可重试', () => {
+    // 与快进路径对称：修复前分叉接收也是“先写节点、再写冲突标记”两次落盘，
+    // 第 2 次失败时留下已保存节点却不进入冲突，重试被吞。
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+
+    let writes = 0;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('QuotaExceededError');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    // 第一个外部修订正常快进（第 1 次写入）
+    ingest({ id: 'a', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('A') });
+    expect(s.head.id).toBe('a');
+    expect(writes).toBe(1);
+
+    // 分叉兄弟修订 B 到达：接收事务（第 2 次写入）配额失败 → 整体回滚
+    const stateBefore = storage.getItem(STATE_STORAGE_KEY);
+    const warningsBefore = r.warnings.length;
+    ingest({ id: 'b', parentRevisionIds: [genesis], clientId: 'c3', plan: rootOnlyPlan('B') });
+    expect(s.inConflict).toBe(false); // 不进入冲突
+    expect(s.head.id).toBe('a');
+    expect(s.getRevision('b')).toBeUndefined(); // 无半提交节点
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateBefore);
+    expect(r.conflicts).toHaveLength(0); // 不触发冲突回调
+    expect(r.warnings.length).toBeGreaterThan(warningsBefore);
+
+    // 存储恢复后同一消息重试：正常进入冲突，等待人工合并
+    vi.restoreAllMocks();
+    ingest({ id: 'b', parentRevisionIds: [genesis], clientId: 'c3', plan: rootOnlyPlan('B') });
+    expect(s.inConflict).toBe(true);
+    expect(r.conflicts.map((c) => c.id)).toEqual(['b']);
+    expect(readState(storage).revisions.map((x) => x.id)).toContain('b');
+    s.destroy();
+  });
+
   it('冲突期间外部合并修订落盘失败：保持冲突锁定，不触发自动消解', () => {
     const storage = new MemStorage();
     const r = rec();

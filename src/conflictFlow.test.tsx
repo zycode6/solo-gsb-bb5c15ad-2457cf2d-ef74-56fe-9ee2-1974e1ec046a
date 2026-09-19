@@ -299,4 +299,78 @@ describe('本地存储写入失败：界面保留提交前规划并显示明确�
     expect(screen.queryByText('数据中心-A')).toBeNull();
     utils.unmount();
   });
+
+  it('外部修订经 storage 事件到达：接收只落盘一次，第二次写入失败整体回滚且同一文档可重投', () => {
+    // 回归：修复前 ingest 先写修订节点、再单独写 head 状态，第二次写入配额
+    // 失败时节点已保存、head 未切换，重投同一文档被当作重复消息忽略。
+    // 修复后接收 + head/冲突/挂起队列更新合并为一次可回滚事务。
+    window.localStorage.clear();
+    render(<App />);
+    // 创世修订已在 mock 安装前落盘
+
+    const extA: Revision = {
+      id: 'ext-a',
+      parentRevisionIds: [GENESIS_REVISION_ID],
+      clientId: 'other-tab',
+      plan: {
+        version: 1,
+        roots: [{ id: 'root-ext-a', name: '外部网段A', cidr: '10.0.0.0/8' }],
+        allocations: [],
+      },
+    };
+    const extB: Revision = {
+      id: 'ext-b',
+      parentRevisionIds: ['ext-a'],
+      clientId: 'other-tab',
+      plan: {
+        version: 1,
+        roots: [
+          { id: 'root-ext-a', name: '外部网段A', cidr: '10.0.0.0/8' },
+          { id: 'root-ext-b', name: '外部网段B', cidr: '172.16.0.0/12' },
+        ],
+        allocations: [],
+      },
+    };
+
+    // 精确复现修复前故障时序：允许第 1 次状态写入，第 2 次配额失败
+    const orig = Storage.prototype.setItem;
+    let writes = 0;
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+      this: Storage,
+      key: string,
+      value: string,
+    ) {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('QuotaExceededError: 存储空间不足');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      return orig.call(this, key, value);
+    });
+
+    // 第一个外部修订：整个接收只有一次原子写入 → 完整快进上屏
+    postExternalRevisions([extA]);
+    expect(writes).toBe(1); // 修复前这里会发生第 2 次写入并配额失败
+    expect(screen.getAllByText('外部网段A').length).toBeGreaterThan(0);
+
+    // 第二个外部修订：接收事务（第 2 次写入）配额失败 → 整体回滚到接收前
+    postExternalRevisions([extA, extB]);
+    expect(screen.queryByText('外部网段B')).toBeNull(); // 界面不切换
+    expect(screen.getByRole('alert').textContent).toContain('本地存储'); // 明确错误
+    // 存储中不留半提交节点，head 仍是 ext-a
+    const raw = window.localStorage.getItem(STATE_STORAGE_KEY)!;
+    expect(raw).not.toContain('ext-b');
+    expect((JSON.parse(raw) as { headId: string }).headId).toBe('ext-a');
+
+    // 存储恢复后重投同一文档：同一消息不被当作重复投递，可完整重试成功
+    vi.restoreAllMocks();
+    postExternalRevisions([extA, extB]);
+    expect(screen.getAllByText('外部网段B').length).toBeGreaterThan(0);
+    expect(
+      (JSON.parse(window.localStorage.getItem(STATE_STORAGE_KEY)!) as { headId: string }).headId,
+    ).toBe('ext-b');
+  });
 });
