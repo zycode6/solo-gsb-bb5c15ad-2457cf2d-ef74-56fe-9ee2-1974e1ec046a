@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import stylesCss from './styles.css?raw';
 import App from './App';
 import { GENESIS_REVISION_ID, STATE_STORAGE_KEY, Revision } from './lib/revisionStore';
-import { emptyPlan } from './lib/model';
+import { Plan, emptyPlan } from './lib/model';
 
 /** 从编译后的样式表中取出某条选择器规则的声明文本（用于回归指针事件/层级修复）。 */
 function declarationsOf(selector: string): string {
@@ -232,6 +232,27 @@ describe('本地存储写入失败：界面保留提交前规划并显示明确�
     });
   }
 
+  /** 只放行前 successes 次状态写入，之后的写入抛配额错误（复现"第二次写入失败"）。 */
+  function breakStateWritesAfter(successes: number) {
+    const orig = Storage.prototype.setItem;
+    let writes = 0;
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+      this: Storage,
+      key: string,
+      value: string,
+    ) {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes > successes) {
+          const err = new Error('QuotaExceededError: 存储空间不足');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      return orig.call(this, key, value);
+    });
+  }
+
   it('普通编辑落盘失败：示例内容不上屏、显示错误提示，刷新后仍为原规划', () => {
     window.localStorage.clear();
     const utils = render(<App />);
@@ -298,5 +319,66 @@ describe('本地存储写入失败：界面保留提交前规划并显示明确�
     expect(screen.queryByRole('alertdialog')).toBeNull();
     expect(screen.queryByText('数据中心-A')).toBeNull();
     utils.unmount();
+  });
+
+  it('外部修订经 storage 事件到达时第二次写入失败：界面回滚无幽灵节点，恢复后重投生效', () => {
+    // 回归：接收曾分两次落盘（先写节点、再切 head），第二次失败会留下已保存
+    // 节点且重投被当作重复消息忽略；合并为一次事务后必须整体回滚、可重试。
+    window.localStorage.clear();
+    render(<App />);
+
+    // 外部标签页基于创世修订提交的链式更新：甲 → 乙
+    const planA: Plan = {
+      version: 1,
+      roots: [{ id: 'root-ext', name: '外部根', cidr: '10.0.0.0/8' }],
+      allocations: [
+        { id: 'alloc-ext-a', name: '外部子网-甲', kind: 'subnet', prefix: 24, cidr: '10.0.0.0/24' },
+      ],
+    };
+    const planB: Plan = {
+      version: 1,
+      roots: [{ id: 'root-ext', name: '外部根', cidr: '10.0.0.0/8' }],
+      allocations: [
+        { id: 'alloc-ext-a', name: '外部子网-甲', kind: 'subnet', prefix: 24, cidr: '10.0.0.0/24' },
+        { id: 'alloc-ext-b', name: '外部子网-乙', kind: 'subnet', prefix: 24, cidr: '10.1.0.0/24' },
+      ],
+    };
+    const revA: Revision = {
+      id: 'ext-a',
+      parentRevisionIds: [GENESIS_REVISION_ID],
+      clientId: 'other-tab-client',
+      plan: planA,
+    };
+    const revB: Revision = {
+      id: 'ext-b',
+      parentRevisionIds: ['ext-a'],
+      clientId: 'other-tab-client',
+      plan: planB,
+    };
+
+    // 第一次状态写入（接收甲）放行，第二次（接收乙）配额失败
+    breakStateWritesAfter(1);
+    postExternalRevisions([revA, revB]);
+
+    // 甲已快进上屏；乙整体回滚：不上屏、不留幽灵节点、提示明确错误
+    expect(screen.getAllByText('外部子网-甲').length).toBeGreaterThan(0);
+    expect(screen.queryByText('外部子网-乙')).toBeNull();
+    expect(screen.getByRole('alert').textContent).toContain('本地存储');
+    let state = JSON.parse(window.localStorage.getItem(STATE_STORAGE_KEY)!) as {
+      headId: string;
+      revisions: Revision[];
+    };
+    expect(state.headId).toBe('ext-a');
+    expect(state.revisions.some((x) => x.id === 'ext-b')).toBe(false);
+
+    // 存储恢复后重投同一批消息：乙不作为重复消息忽略，正常快进上屏
+    vi.restoreAllMocks();
+    postExternalRevisions([revA, revB]);
+    expect(screen.getAllByText('外部子网-乙').length).toBeGreaterThan(0);
+    state = JSON.parse(window.localStorage.getItem(STATE_STORAGE_KEY)!) as {
+      headId: string;
+      revisions: Revision[];
+    };
+    expect(state.headId).toBe('ext-b');
   });
 });

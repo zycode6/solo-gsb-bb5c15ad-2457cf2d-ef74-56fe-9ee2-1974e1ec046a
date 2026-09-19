@@ -736,6 +736,178 @@ describe('存储写入失败（配额耗尽/权限限制）：先落盘后改内
     s.destroy();
   });
 
+  it('链式接收中第二次写入失败：整体回滚不留节点，恢复存储后同一消息可重试', () => {
+    // 回归：接收曾分两步落盘（先写修订节点、再切换 head），第二次写入失败时
+    // 节点已保存而 head 未切换，重试又被当作重复消息忽略，head 永远卡住。
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    const a: Revision = {
+      id: 'a',
+      parentRevisionIds: [genesis],
+      clientId: 'c2',
+      plan: rootOnlyPlan('A'),
+    };
+    const b: Revision = {
+      id: 'b',
+      parentRevisionIds: ['a'],
+      clientId: 'c2',
+      plan: rootOnlyPlan('B'),
+    };
+
+    // 第一次状态写入放行、第二次写入抛配额错误（复现"节点已保存、head 未切换"）
+    let writes = 0;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('QuotaExceededError: 存储空间不足');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    ingest(a); // 第一次写入成功：接收 + 快进到 a 一并落盘
+    expect(s.head.id).toBe('a');
+    const stateAfterA = storage.getItem(STATE_STORAGE_KEY);
+
+    ingest(b); // 第二次写入失败：必须整体回滚到接收 b 之前
+    expect(s.head.id).toBe('a');
+    expect(s.getRevision('b')).toBeUndefined(); // 不留已保存节点
+    expect(readState(storage).revisions.some((x) => x.id === 'b')).toBe(false);
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateAfterA); // 持久化状态未变
+    expect(r.ff.map((f) => f.id)).toEqual(['a']); // b 未触发快进回调
+    expect(r.warnings.length).toBeGreaterThan(0);
+    expect(r.warnings[r.warnings.length - 1]).toContain('本地存储');
+
+    // 存储恢复后同一消息原样重试：不被误判为重复消息，正常快进
+    vi.restoreAllMocks();
+    ingest(b);
+    expect(s.head.id).toBe('b');
+    expect(r.ff.map((f) => f.id)).toEqual(['a', 'b']);
+    expect(readState(storage).headId).toBe('b');
+    s.destroy();
+  });
+
+  it('分叉接收的第二次写入失败：不进入冲突、节点不残留，恢复后同一消息可重试进入冲突', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    const local: Revision = {
+      id: 'local',
+      parentRevisionIds: [genesis],
+      clientId: 'c2',
+      plan: rootOnlyPlan('L'),
+    };
+    const remote: Revision = {
+      id: 'remote',
+      parentRevisionIds: [genesis],
+      clientId: 'c3',
+      plan: rootOnlyPlan('R'),
+    };
+
+    // 第一次写入（local 接收）成功，第二次写入（remote 接收）权限拒绝
+    let writes = 0;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('SecurityError: 写入被拒绝');
+          err.name = 'SecurityError';
+          throw err;
+        }
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    ingest(local); // 写 #1 成功：快进到 local
+    expect(s.head.id).toBe('local');
+    const stateAfterLocal = storage.getItem(STATE_STORAGE_KEY);
+
+    ingest(remote); // 写 #2 失败：不得进入冲突、不得残留节点
+    expect(s.inConflict).toBe(false);
+    expect(s.head.id).toBe('local');
+    expect(s.getRevision('remote')).toBeUndefined();
+    expect(readState(storage).revisions.some((x) => x.id === 'remote')).toBe(false);
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateAfterLocal);
+    expect(r.conflicts).toHaveLength(0); // 未触发冲突回调
+    expect(r.warnings.length).toBeGreaterThan(0);
+
+    // 存储恢复后重试同一消息：正常进入冲突并保留两份
+    vi.restoreAllMocks();
+    ingest(remote);
+    expect(s.inConflict).toBe(true);
+    expect(s.head.id).toBe('local');
+    expect(r.conflicts.map((c) => c.id)).toEqual(['remote']);
+    expect(s.getRevision('remote')).toBeDefined();
+    s.destroy();
+  });
+
+  it('BroadcastChannel 入口与直接接收一致：第二次写入失败回滚，恢复后重投同一消息成功', async () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const sender = new FakeChannel('test');
+    await flush();
+
+    const a: Revision = {
+      id: 'ch-a',
+      parentRevisionIds: [genesis],
+      clientId: 'c2',
+      plan: rootOnlyPlan('A'),
+    };
+    const b: Revision = {
+      id: 'ch-b',
+      parentRevisionIds: ['ch-a'],
+      clientId: 'c2',
+      plan: rootOnlyPlan('B'),
+    };
+
+    let writes = 0;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        writes += 1;
+        if (writes === 2) {
+          const err = new Error('QuotaExceededError');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    sender.postMessage({ type: 'revision', revision: a });
+    await flush();
+    expect(s.head.id).toBe('ch-a'); // 第一次写入成功
+
+    sender.postMessage({ type: 'revision', revision: b });
+    await flush();
+    // 第二次写入失败：与直接 ingest 一样整体回滚，不触发快进回调
+    expect(s.head.id).toBe('ch-a');
+    expect(s.getRevision('ch-b')).toBeUndefined();
+    expect(readState(storage).revisions.some((x) => x.id === 'ch-b')).toBe(false);
+    expect(r.ff.map((f) => f.id)).toEqual(['ch-a']);
+    expect(r.warnings.length).toBeGreaterThan(0);
+
+    // 恢复存储后重投同一频道消息：不作为重复消息忽略，正常快进
+    vi.restoreAllMocks();
+    sender.postMessage({ type: 'revision', revision: b });
+    await flush();
+    expect(s.head.id).toBe('ch-b');
+    expect(r.ff.map((f) => f.id)).toEqual(['ch-a', 'ch-b']);
+    s.destroy();
+    sender.close();
+  });
+
   it('冲突期间外部合并修订落盘失败：保持冲突锁定，不触发自动消解', () => {
     const storage = new MemStorage();
     const r = rec();
